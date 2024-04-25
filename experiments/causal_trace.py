@@ -135,7 +135,7 @@ def trace_with_patch(
     inp,  # A set of inputs
     states_to_patch,  # A list of (token index, layername) triples to restore
     answers_t,  # Answer probabilities to collect
-    tokens_to_mix,  # Range of tokens to corrupt (begin, end)
+    subject_token_index,  # list of tokens index to corrupt
     noise=0.1,  # Level of noise to add
     uniform_noise=False,
     replace=False,  # True to replace with instead of add noise
@@ -188,15 +188,14 @@ def trace_with_patch(
     def patch_rep(x, layer):
         if layer == embed_layername:
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
-            if tokens_to_mix is not None:
-                b, e = tokens_to_mix
+            if subject_token_index is not None:
                 noise_data = noise_fn(
-                    torch.from_numpy(prng(x.shape[0] - 1, e - b, x.shape[2]))
+                    torch.from_numpy(prng(x.shape[0] - 1, len(subject_token_index), x.shape[2]))
                 ).to(x.device)
                 if replace:
-                    x[1:, b:e] = noise_data
+                    x[1:, subject_token_index] = noise_data
                 else:
-                    x[1:, b:e] += noise_data
+                    x[1:, subject_token_index] += noise_data
             return x
         if layer not in patch_spec:
             return x
@@ -235,7 +234,7 @@ def trace_with_repatch(
     states_to_patch,  # A list of (token index, layername) triples to restore
     states_to_unpatch,  # A list of (token index, layername) triples to re-randomize
     answers_t,  # Answer probabilities to collect
-    tokens_to_mix,  # Range of tokens to corrupt (begin, end)
+    subject_token_index,  # List of tokens to corrupt
     noise=0.1,  # Level of noise to add
     uniform_noise=False,
 ):
@@ -260,10 +259,9 @@ def trace_with_repatch(
     def patch_rep(x, layer):
         if layer == embed_layername:
             # If requested, we corrupt a range of token embeddings on batch items x[1:]
-            if tokens_to_mix is not None:
-                b, e = tokens_to_mix
-                x[1:, b:e] += noise * torch.from_numpy(
-                    prng(x.shape[0] - 1, e - b, x.shape[2])
+            if subject_token_index is not None:
+                x[1:, subject_token_index] += noise * torch.from_numpy(
+                    prng(x.shape[0] - 1, len(subject_token_index), x.shape[2])
                 ).to(x.device)
             return x
         if first_pass or (layer not in patch_spec and layer not in unpatch_spec):
@@ -300,6 +298,7 @@ def calculate_hidden_flow(
     subject,
     samples=10,
     noise=0.1,
+    subject_token_index=None,
     token_range=None,
     uniform_noise=False,
     replace=False,
@@ -316,21 +315,23 @@ def calculate_hidden_flow(
         answer_t, base_score = [d[0] for d in predict_from_input(mt.model, inp)]
     [answer] = decode_tokens(mt.tokenizer, [answer_t])
     if expect is not None and answer.strip() != expect:
-        return dict(correct_prediction=False)
-    e_range = find_token_range(mt.tokenizer, inp["input_ids"][0], subject)
+        print(f"Warning: expected {expect} but got {answer} as the answer. (Still tracing {expect})")
+        answer_t = mt.tokenizer.encode(expect)[0]
+    if subject_token_index is None:
+        subject_token_index = list(range(*find_token_range(mt.tokenizer, inp["input_ids"][0], subject)))
     if token_range == "subject_last":
-        token_range = [e_range[1] - 1]
+        token_range = [subject_token_index[-1]]
     elif token_range is not None:
         raise ValueError(f"Unknown token_range: {token_range}")
     low_score = trace_with_patch(
-        mt.model, inp, [], answer_t, e_range, noise=noise, uniform_noise=uniform_noise
+        mt.model, inp, [], answer_t, subject_token_index, noise=noise, uniform_noise=uniform_noise
     ).item()
     if not kind:
         differences = trace_important_states(
             mt.model,
             mt.num_layers,
             inp,
-            e_range,
+            subject_token_index,
             answer_t,
             noise=noise,
             uniform_noise=uniform_noise,
@@ -342,7 +343,7 @@ def calculate_hidden_flow(
             mt.model,
             mt.num_layers,
             inp,
-            e_range,
+            subject_token_index,
             answer_t,
             noise=noise,
             uniform_noise=uniform_noise,
@@ -358,8 +359,8 @@ def calculate_hidden_flow(
         high_score=base_score,
         input_ids=inp["input_ids"][0],
         input_tokens=decode_tokens(mt.tokenizer, inp["input_ids"][0]),
-        subject_range=e_range,
-        answer=answer,
+        subject_range=subject_token_index,
+        answer=expect if expect else answer,
         window=window,
         correct_prediction=True,
         kind=kind or "",
@@ -370,7 +371,7 @@ def trace_important_states(
     model,
     num_layers,
     inp,
-    e_range,
+    subject_token_index,
     answer_t,
     noise=0.1,
     uniform_noise=False,
@@ -390,7 +391,7 @@ def trace_important_states(
                 inp,
                 [(tnum, layername(model, layer))],
                 answer_t,
-                tokens_to_mix=e_range,
+                subject_token_index=subject_token_index,
                 noise=noise,
                 uniform_noise=uniform_noise,
                 replace=replace,
@@ -404,7 +405,7 @@ def trace_important_window(
     model,
     num_layers,
     inp,
-    e_range,
+    subject_token_index,
     answer_t,
     kind,
     window=10,
@@ -432,7 +433,7 @@ def trace_important_window(
                 inp,
                 layerlist,
                 answer_t,
-                tokens_to_mix=e_range,
+                subject_token_index=subject_token_index,
                 noise=noise,
                 uniform_noise=uniform_noise,
                 replace=replace,
@@ -503,13 +504,15 @@ def guess_subject(prompt):
         0
     ].strip()
 
-
+    
 def plot_hidden_flow(
     mt,
     prompt,
     subject=None,
+    subject_token_index=None,
     samples=10,
     noise=0.1,
+    expect=None,
     uniform_noise=False,
     window=10,
     kind=None,
@@ -521,14 +524,15 @@ def plot_hidden_flow(
         mt,
         prompt,
         subject,
+        subject_token_index=subject_token_index,
         samples=samples,
         noise=noise,
         uniform_noise=uniform_noise,
         window=window,
         kind=kind,
+        expect=expect
     )
     plot_trace_heatmap(result, savepdf)
-
 
 
 def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=None):
@@ -542,7 +546,7 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
     )
     window = result.get("window", 10)
     labels = list(result["input_tokens"])
-    for i in range(*result["subject_range"]):
+    for i in result["subject_range"]:
         labels[i] = labels[i] + "*"
 
     # with plt.rc_context(rc={"font.family": "Times New Roman"}):
@@ -584,9 +588,9 @@ def plot_trace_heatmap(result, savepdf=None, title=None, xlabel=None, modelname=
         plt.show()
 
 
-def plot_all_flow(mt, prompt, subject=None):
+def plot_all_flow(mt, prompt, noise=0.1, subject=None, subject_token_index=None, expect=None):
     for kind in ["mlp", "attn", None]:
-        plot_hidden_flow(mt, prompt, subject, kind=kind)
+        plot_hidden_flow(mt, prompt, subject, subject_token_index=subject_token_index, noise=noise, expect=expect, kind=kind)
 
 
 # Utilities for dealing with tokens
